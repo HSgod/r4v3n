@@ -252,27 +252,22 @@ pub(crate) fn resolve(list: &HostList) -> bool {
 }
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL)"
 Texture2D<float> depth_ : register(t0);
 Texture2D<uint> stencil_ : register(t1);
-[RootSignature(RS)]
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 struct Both { float depth : SV_Depth; uint stencil : SV_StencilRef; };
-[RootSignature(RS)]
 Both both(float4 at : SV_Position) {
     Both o;
     o.depth = depth_.Load(int3(at.xy, 0));
     o.stencil = stencil_.Load(int3(at.xy, 0));
     return o;
 }
-[RootSignature(RS)]
 float depth_only(float4 at : SV_Position) : SV_Depth {
     return depth_.Load(int3(at.xy, 0));
 }
-[RootSignature(RS)]
 uint stencil_only(float4 at : SV_Position) : SV_StencilRef {
     return stencil_.Load(int3(at.xy, 0));
 }
@@ -338,11 +333,6 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     code.ok_or_else(windows::core::Error::empty)
 }
 
-fn bytes(b: &ID3DBlob) -> &[u8] {
-    // SAFETY: the blob's own bytes, alive as long as it.
-    unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) }
-}
-
 fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     let vs = compile(s!("vs"), s!("vs_5_1"))?;
     let both = compile(s!("both"), s!("ps_5_1"))?;
@@ -363,8 +353,14 @@ fn make_copier(host: &Host) -> windows::core::Result<Copier> {
     if !stencil_ref {
         tracing::warn!("the host takes no stencil from pixel shaders: depth twins copy depth only");
     }
-    // SAFETY: a root signature the compiler embedded.
-    let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, bytes(&vs))? };
+    let ranges = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 2, 0)];
+    let params = [crate::host::root_table(&ranges, D3D12_SHADER_VISIBILITY_PIXEL)];
+    let root = crate::host::serialize_root_signature(
+        device,
+        &params,
+        &[],
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
     // SAFETY: a plain description.
     let views = unsafe {
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

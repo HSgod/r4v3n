@@ -31,7 +31,6 @@ use crate::watch::PAGE;
 /// One workgroup (`SV_GroupID.x`) hashes one 64 KiB buffer-relative piece using
 /// 64 threads reading coalesced 1024-byte strides (64 iterations per page).
 const CARD_COMPARE_HLSL: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // first 64 KiB piece index
     uint pad0;     // reserved (0)
@@ -46,7 +45,6 @@ RWByteAddressBuffer differs : register(u1);
 
 groupshared uint4 s_acc[64];
 
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     if (gid.x >= pieces) return;
@@ -401,9 +399,18 @@ impl CardEngine {
         let bytecode = unsafe {
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
-        // SAFETY: bytecode embeds `[RootSignature(RS)]`.
-        let root_sig: ID3D12RootSignature =
-            unsafe { host.device.CreateRootSignature(0, bytecode)? };
+        let params = [
+            crate::host::root_constants(0, 6, D3D12_SHADER_VISIBILITY_ALL),
+            crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, D3D12_SHADER_VISIBILITY_ALL),
+            crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, D3D12_SHADER_VISIBILITY_ALL),
+            crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL),
+        ];
+        let root_sig = crate::host::serialize_root_signature(
+            &host.device,
+            &params,
+            &[],
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        )?;
         let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::ManuallyDrop::new(Some(root_sig.clone())),
             CS: D3D12_SHADER_BYTECODE {

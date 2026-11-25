@@ -140,7 +140,6 @@ fn live_level() -> Option<f32> {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=8, b0), DescriptorTable(UAV(u0), SRV(t0))"
 cbuffer Floor : register(b0) {
     float level; float3 tint;
     float strength; float radius; float near; float tan_y;
@@ -192,7 +191,6 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
     uint w, h;
@@ -252,9 +250,22 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
         return Err(e);
     }
     let code = text(&code.ok_or_else(windows::core::Error::empty)?);
-    // SAFETY: the root signature is inside the shader; plain creations.
+    let ranges = [
+        crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1, 0),
+        crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 1, 1),
+    ];
+    let params = [
+        crate::host::root_constants(0, 8, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_table(&ranges, D3D12_SHADER_VISIBILITY_ALL),
+    ];
+    let root = crate::host::serialize_root_signature(
+        device,
+        &params,
+        &[],
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
+    // SAFETY: plain D3D12 creations with a live root signature and shader blob.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &code)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {

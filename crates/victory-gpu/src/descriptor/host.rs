@@ -585,16 +585,18 @@ impl HostHeap {
             Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                let cap = PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS;
+                let kept = wanted.min(cap);
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = kept,
+                    lost = wanted.saturating_sub(kept),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    make(kept + DYNAMIC_CAPPED).ok()?,
+                    kept,
                     DYNAMIC_CAPPED,
                 )
             }
@@ -2898,12 +2900,6 @@ mod tests {
 
     fn compile_probe_cs(device: &ID3D12Device) -> (ID3D12RootSignature, ID3D12PipelineState) {
         const PROBE_HLSL: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), \
-            DescriptorTable(CBV(b0, numDescriptors=1)), \
-            DescriptorTable(SRV(t1, numDescriptors=1)), \
-            DescriptorTable(UAV(u0, numDescriptors=1)), \
-            DescriptorTable(SRV(t2, numDescriptors=1)), \
-            DescriptorTable(CBV(b1, numDescriptors=1))"
 ByteAddressBuffer srv_buf : register(t0);
 cbuffer Cbv16 : register(b0) { uint4 cb_vals; };
 Texture2D<float4> placed_tex : register(t1);
@@ -2911,7 +2907,6 @@ RWByteAddressBuffer uav_buf : register(u0);
 ByteAddressBuffer copied_srv : register(t2);
 cbuffer NullCbv : register(b1) { uint4 null_vals; };
 
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     uint v_srv = srv_buf.Load(0);
@@ -2952,7 +2947,27 @@ void main() {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let r0 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 1, 0)];
+            let r1 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 0, 1, 0)];
+            let r2 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0)];
+            let r3 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1, 0)];
+            let r4 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 1, 0)];
+            let r5 = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0)];
+            let params = [
+                crate::host::root_table(&r0, D3D12_SHADER_VISIBILITY_ALL),
+                crate::host::root_table(&r1, D3D12_SHADER_VISIBILITY_ALL),
+                crate::host::root_table(&r2, D3D12_SHADER_VISIBILITY_ALL),
+                crate::host::root_table(&r3, D3D12_SHADER_VISIBILITY_ALL),
+                crate::host::root_table(&r4, D3D12_SHADER_VISIBILITY_ALL),
+                crate::host::root_table(&r5, D3D12_SHADER_VISIBILITY_ALL),
+            ];
+            let root = crate::host::serialize_root_signature(
+                device,
+                &params,
+                &[],
+                D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            )
+            .unwrap();
             let pso = device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),
@@ -3082,11 +3097,9 @@ void main() {
             return; // no host GPU
         };
         const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0), UAV(u0, numDescriptors = 2))"
 ByteAddressBuffer view : register(t0);
 RWByteAddressBuffer window : register(u0);
 RWByteAddressBuffer seen : register(u1);
-[RootSignature(RS)]
 [numthreads(32, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     seen.Store(id.x * 4, view.Load(id.x * 4));
@@ -3120,7 +3133,18 @@ void main(uint3 id : SV_DispatchThreadID) {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let ranges = [
+                crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 1, 0),
+                crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 2, 1),
+            ];
+            let params = [crate::host::root_table(&ranges, D3D12_SHADER_VISIBILITY_ALL)];
+            let root = crate::host::serialize_root_signature(
+                device,
+                &params,
+                &[],
+                D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            )
+            .unwrap();
             let pso: ID3D12PipelineState = device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),

@@ -28,7 +28,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -39,14 +38,13 @@ cbuffer Record : register(b0) {
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
-RWByteAddressBuffer dst_args : register(u0);
+RWStructuredBuffer<uint> dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
@@ -55,7 +53,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = (id.x * stride) >> 2;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -83,15 +81,16 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool over = false;
     if (cost > 0) {
         uint before;
-        budget.InterlockedOr(0, 0, before);
+        InterlockedAdd(budget[0], 0u, before);
         // Bounded retries: an unbounded loop of atomics is a GPU hang if
         // contention never settles; a record that gives up runs empty.
         bool settled = false;
-        [allow_uav_condition]
-        for (uint tries = 0; tries < 256 && before < BUDGET; tries++) {
+        [loop]
+        for (uint tries = 0; tries < 256; tries++) {
+            if (before >= BUDGET) break;
             uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
             uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
+            InterlockedCompareExchange(budget[0], before, next, prev);
             if (prev == before) { settled = true; break; }
             before = prev;
         }
@@ -101,17 +100,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (over) {
             draw_counts = uint2(0, 0);
         }
-        dst_args.Store2(dst_at, draw_counts);
+        dst_args[dst_at] = draw_counts.x;
+        dst_args[dst_at + 1] = draw_counts.y;
         for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + (off >> 2)] = src_args.Load(src_at + off);
         }
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
         }
-        dst_args.Store3(dst_at, groups);
+        dst_args[dst_at] = groups.x;
+        dst_args[dst_at + 1] = groups.y;
+        dst_args[dst_at + 2] = groups.z;
         for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            dst_args[dst_at + (off >> 2)] = src_args.Load(src_at + off);
         }
     }
 }
@@ -178,11 +180,23 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let params = [
+        crate::host::root_constants(0, 6, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 0, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_SRV, 1, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL),
+    ];
+    let root = crate::host::serialize_root_signature(
+        device,
+        &params,
+        &[],
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
+    // SAFETY: the blob's own bytes and our serialized root signature.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -478,9 +492,7 @@ mod tests {
     use windows::core::Interface;
 
     const WORKER_CS: &str = r#"
-#define RS "UAV(u0)"
 RWByteAddressBuffer hits : register(u0);
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
@@ -685,7 +697,17 @@ void main() {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let params = [crate::host::root_descriptor(
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
+                0,
+                D3D12_SHADER_VISIBILITY_ALL,
+            )];
+            let root = crate::host::serialize_root_signature(
+                device,
+                &params,
+                &[],
+                D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            )?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -704,6 +726,7 @@ void main() {
         if super::host().is_none() {
             return; // no host GPU here
         }
+        super::make().expect("argument clamp builds");
         assert!(super::clamp().is_some());
     }
 

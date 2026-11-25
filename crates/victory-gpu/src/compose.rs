@@ -12,19 +12,16 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -71,13 +68,29 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
 
 fn make(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Composer> {
     let (vs, ps) = (compile(s!("vs"), s!("vs_5_1"))?, compile(s!("ps"), s!("ps_5_1"))?);
+    let ranges = [crate::host::desc_range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 2, 0)];
+    let params = [crate::host::root_table(&ranges, D3D12_SHADER_VISIBILITY_PIXEL)];
+    let samplers = [D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        MaxLOD: f32::MAX,
+        ShaderRegister: 0,
+        RegisterSpace: 0,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        ..Default::default()
+    }];
+    let device = &host.device;
+    let root = crate::host::serialize_root_signature(
+        device,
+        &params,
+        &samplers,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
     // SAFETY: the blobs' own bytes, alive through the calls.
     unsafe {
-        let bytes = |b: &ID3DBlob| {
-            std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-        };
-        let device = &host.device;
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
         let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
             pShaderBytecode: b.GetBufferPointer(),
             BytecodeLength: b.GetBufferSize(),

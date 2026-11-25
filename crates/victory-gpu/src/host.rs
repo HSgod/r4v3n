@@ -3431,6 +3431,110 @@ impl Host {
     }
 }
 
+/// Serializes and creates a root signature through `D3D12SerializeRootSignature`
+/// instead of reading `[RootSignature(...)]` from `D3DCompile` output: Wine's
+/// `d3dcompiler_47` omits embedded root signatures, causing `CreateRootSignature`
+/// on shader bytecode to fail with `E_FAIL`.
+pub(crate) fn serialize_root_signature(
+    device: &ID3D12Device,
+    parameters: &[D3D12_ROOT_PARAMETER],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: if parameters.is_empty() {
+            std::ptr::null()
+        } else {
+            parameters.as_ptr()
+        },
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: if samplers.is_empty() {
+            std::ptr::null()
+        } else {
+            samplers.as_ptr()
+        },
+        Flags: flags,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    // SAFETY: `desc` points to live slices; `blob` is owned by the runtime and
+    // read while alive.
+    unsafe {
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
+pub(crate) fn root_constants(
+    register: u32,
+    count: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Num32BitValues: count,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
+pub(crate) fn root_descriptor(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    register: u32,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
+pub(crate) fn desc_range(
+    kind: D3D12_DESCRIPTOR_RANGE_TYPE,
+    register: u32,
+    count: u32,
+    offset: u32,
+) -> D3D12_DESCRIPTOR_RANGE {
+    D3D12_DESCRIPTOR_RANGE {
+        RangeType: kind,
+        NumDescriptors: count,
+        BaseShaderRegister: register,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: offset,
+    }
+}
+
+pub(crate) fn root_table(
+    ranges: &[D3D12_DESCRIPTOR_RANGE],
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: ranges.len() as u32,
+                pDescriptorRanges: ranges.as_ptr(),
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {

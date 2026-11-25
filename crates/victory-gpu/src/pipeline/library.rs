@@ -453,13 +453,30 @@ pub(crate) fn save(now: bool) {
 /// share a temporary file.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    static PUBLISH: Mutex<()> = Mutex::new(());
     let extension = format!(
         "tmp-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| {
+        let _guard = PUBLISH.lock().unwrap_or_else(|e| e.into_inner());
+        // Concurrent writers racing on replace-by-rename can briefly hit
+        // PermissionDenied on Windows/Wine before the target closes.
+        let mut last = Ok(());
+        for attempt in 0..8 {
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 7 => {
+                    last = Err(e);
+                    std::thread::sleep(std::time::Duration::from_millis(1 << attempt.min(4)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        last
+    });
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -519,6 +536,10 @@ mod tests {
         let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else {
             return; // no host GPU here
         };
+        // Some hosts (notably vkd3d-proton) do not implement ID3D12PipelineLibrary.
+        if unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[]) }.is_err() {
+            return;
+        }
         let library = open(&device, b"not a pipeline library".repeat(16)).expect("an empty library");
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);

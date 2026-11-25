@@ -26,7 +26,6 @@ use crate::host::{Host, HostList, host, transition};
 pub(crate) const ELEMENTS: usize = 12;
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=16, b0), UAV(u0), UAV(u1)"
 cbuffer C : register(b0) {
     // 0: expand vertices; 1: rewrite draw records.
     uint mode;
@@ -38,8 +37,8 @@ cbuffer C : register(b0) {
     // offset | DXGI format << 16, per element.
     uint4 e[3];
 };
-RWByteAddressBuffer src : register(u0);
-RWByteAddressBuffer dst : register(u1);
+RWStructuredBuffer<uint> src : register(u0);
+RWStructuredBuffer<uint> dst : register(u1);
 
 uint element(uint i) { return e[i / 4][i % 4]; }
 
@@ -62,7 +61,7 @@ void format(uint f, out uint n, out uint kind) {
 uint bytes(uint kind) { return kind == 0 ? 4 : kind == 3 ? 1 : 2; }
 
 float read(uint at, uint kind) {
-    uint word = src.Load(at & ~3u);
+    uint word = src[at >> 2];
     uint shift = (at & 3u) * 8;
     if (kind == 0) return asfloat(word);
     if (kind == 1) return f16tof32((word >> shift) & 0xFFFF);
@@ -71,27 +70,32 @@ float read(uint at, uint kind) {
 }
 
 void write(uint at, uint kind, float v) {
-    if (kind == 0) { dst.Store(at, asuint(v)); return; }
+    if (kind == 0) { dst[at >> 2] = asuint(v); return; }
     uint bits;
     uint mask;
     if (kind == 1) { bits = f32tof16(v); mask = 0xFFFF; }
     else if (kind == 2) { bits = uint(round(saturate(v) * 65535.0)); mask = 0xFFFF; }
     else { bits = uint(round(saturate(v) * 255.0)); mask = 0xFF; }
-    uint word_at = at & ~3u;
+    uint word_idx = at >> 2;
     uint shift = (at & 3u) * 8;
-    uint word = dst.Load(word_at);
-    dst.Store(word_at, (word & ~(mask << shift)) | ((bits & mask) << shift));
+    uint word = dst[word_idx];
+    dst[word_idx] = (word & ~(mask << shift)) | ((bits & mask) << shift);
 }
 
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
     if (mode == 1) {
         // D3D12_DRAW_ARGUMENTS: vertices, instances, first vertex, first instance.
-        uint at = id.x * stride;
-        uint4 a = src.Load4(at);
-        dst.Store4(at, uint4(a.x / 3 * 6, a.y, a.z / 3 * 6, a.w));
+        uint at = (id.x * stride) >> 2;
+        uint ax = src[at];
+        uint ay = src[at + 1];
+        uint az = src[at + 2];
+        uint aw = src[at + 3];
+        dst[at] = ax / 3 * 6;
+        dst[at + 1] = ay;
+        dst[at + 2] = az / 3 * 6;
+        dst[at + 3] = aw;
         return;
     }
     uint from = id.x * 3 * stride;
@@ -100,7 +104,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint order[6] = { 0, 1, 2, 0, 2, 0 };
     for (uint k = 0; k < 6; k++) {
         for (uint b = 0; b < stride; b += 4) {
-            dst.Store(to + k * stride + b, src.Load(from + order[k] * stride + b));
+            dst[(to + k * stride + b) >> 2] = src[(from + order[k] * stride + b) >> 2];
         }
     }
     uint fourth = to + 5 * stride;
@@ -174,10 +178,20 @@ fn make() -> windows::core::Result<Expand> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let params = [
+        crate::host::root_constants(0, 16, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 0, D3D12_SHADER_VISIBILITY_ALL),
+        crate::host::root_descriptor(D3D12_ROOT_PARAMETER_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL),
+    ];
+    let root = crate::host::serialize_root_signature(
+        device,
+        &params,
+        &[],
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
+    // SAFETY: the blob's own bytes and our serialized root signature.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -324,6 +338,7 @@ mod tests {
         if super::host().is_none() {
             return; // no host GPU here
         }
+        super::make().expect("rectangle expansion builds");
         assert!(super::expand().is_some());
     }
 }
