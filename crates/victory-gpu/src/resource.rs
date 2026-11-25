@@ -1154,10 +1154,12 @@ fn over_cap(d: &ResourceDesc) -> u32 {
     }
     let max = set.unwrap_or_else(|| {
         if crate::host::low_memory() {
-            match video_memory_percent() {
-                0..60 => 512,
-                _ => 256,
-            }
+            // On 16 GB unified RAM/VRAM hosts, DXGI's reported video budget
+            // does not account for the 5+ GiB guest RAM pool sharing the same
+            // physical memory; capping streamed BC textures at 256 prevents
+            // multi-gigabyte GTT/swap thrashing while staying overridable via
+            // VICTORY_TEXTURE_MAX.
+            256
         } else {
             match video_memory_percent() {
                 0..70 => 1024,

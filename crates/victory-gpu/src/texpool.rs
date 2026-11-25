@@ -9,6 +9,15 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 /// Textures larger than this have memory of their own.
 const LARGEST: u64 = 8 << 20;
+const LARGEST_LOW_MEM: u64 = 2 << 20;
+
+fn largest() -> u64 {
+    if crate::host::low_memory() {
+        LARGEST_LOW_MEM
+    } else {
+        LARGEST
+    }
+}
 
 struct Slab {
     /// `None` once no slot was used.
@@ -74,7 +83,18 @@ fn class(bytes: u64) -> u64 {
 fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(Slot, Memory)> {
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
     let of = slabs.entry(size).or_default();
-    let bytes = (size.0 * 8).clamp(1 << 20, 16 << 20).next_multiple_of(64 << 10);
+    let bytes = if crate::host::low_memory() {
+        if size.1 {
+            // Staging upload slabs: keep padding tight on 16 GB UMA hosts.
+            (size.0 * 2).clamp(128 << 10, 2 << 20).max(size.0)
+        } else {
+            // Texture slabs: avoid 8x empty heap padding across dozens of size classes.
+            (size.0 * 2).clamp(256 << 10, 4 << 20).max(size.0)
+        }
+    } else {
+        (size.0 * 8).clamp(1 << 20, 16 << 20)
+    }
+    .next_multiple_of(64 << 10);
     let used = of.iter().position(|s| s.memory.is_some() && !s.free.is_empty());
     let at = match used.or_else(|| of.iter().position(|s| s.memory.is_none())) {
         Some(at) => at,
@@ -103,7 +123,7 @@ pub(crate) fn staging(
     host: &crate::host::Host,
     bytes: u64,
 ) -> Option<(ID3D12Resource, *mut u8, u64, Slot)> {
-    if cfg!(test) || bytes > LARGEST {
+    if cfg!(test) || bytes > largest() {
         return None;
     }
     let size = class(bytes.max(1));
@@ -138,7 +158,7 @@ pub(crate) fn place(
         // SAFETY: as above.
         info = unsafe { device.GetResourceAllocationInfo(0, &[desc]) };
     }
-    if info.SizeInBytes == 0 || info.SizeInBytes > LARGEST || info.Alignment > 64 << 10 {
+    if info.SizeInBytes == 0 || info.SizeInBytes > largest() || info.Alignment > 64 << 10 {
         return None;
     }
     let size = class(info.SizeInBytes);

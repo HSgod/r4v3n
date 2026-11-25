@@ -1565,9 +1565,13 @@ fn sweeps() -> u8 {
 /// Gives back the tiles nothing has asked about for some frames: what
 /// viewed them is gone. At the present of `frame`.
 pub(crate) fn sweep(frame: u64) {
-    const EVERY: u64 = 32;
     let mode = sweeps();
-    if !frame.is_multiple_of(EVERY) || mode == 0 {
+    if mode == 0 {
+        return;
+    }
+    let gone_only = mode >= 2;
+    let every: u64 = if gone_only { 128 } else { 32 };
+    if !frame.is_multiple_of(every) {
         return;
     }
     // Once a frame, whoever asks.
@@ -1575,7 +1579,6 @@ pub(crate) fn sweep(frame: u64) {
     if LAST.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let gone_only = mode >= 2;
     let keep: u64 = if gone_only { 600 } else { 120 };
     let mut given = 0u64;
     let started = std::time::Instant::now();
