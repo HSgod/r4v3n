@@ -3753,6 +3753,22 @@ impl<'a> Lower<'a> {
         {
             return self.boolean(m, self.cur);
         }
+        if let Some(&Operand::Const(k)) = mask {
+            let x = crate::resource::inline(k).ok_or(UNTRACKED_SELECT)?;
+            if x == 0 {
+                return Ok(self.s.m.bool(false));
+            }
+            if x == u32::MAX {
+                return Ok(self.s.m.bool(true));
+            }
+            if self.console_lanes {
+                let lo = self.s.m.i32(x);
+                let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                self.s.flags |= flags::WAVE_OPS;
+                return Ok(self.lane_bit(self.cur, lo, Some(hi)));
+            }
+            return Err("a constant lane mask");
+        }
         let Some(&Operand::Scalar { code, .. }) = mask else {
             return Err(UNTRACKED_SELECT);
         };
@@ -10408,9 +10424,21 @@ impl<'a> Lower<'a> {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     self.as_int(f)
                 } else if f16 {
-                    let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    // omod and clamp are part of the f16 instruction; op_sel[3]
+                    // picks the destination half.
+                    if let Fields::Valu(v) = &inst.fields {
+                        if v.omod != 0 {
+                            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                            let k = self.s.m.f32(factor.to_bits());
+                            f = self.s.m.bin(c, Bin::Mul, f, k);
+                        }
+                        if v.clamp {
+                            f = self.unary(7, f);
+                        }
+                    }
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;

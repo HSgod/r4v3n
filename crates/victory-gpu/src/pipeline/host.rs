@@ -394,6 +394,23 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Whether the host D3D12 runtime supports anisotropic filtering with point mip
+/// selection (`D3D12_OPTIONS19`).
+fn aniso_point_mip_supported(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the feature query writes the structure of the given size.
+    // Older runtimes may not recognize OPTIONS19; that means no support.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.AnisoFilterWithPointMipSupported.as_bool()
+}
+
 /// Compiles one translated compute shader into the host pipeline library (and
 /// GPU driver shader cache) using the exact same root signature and library
 /// key as [`HostPipeline::new`]. Returns `Ok(true)` if already loaded from the
@@ -402,6 +419,7 @@ pub(crate) fn precompile_compute(
     shader: &victory_shader::emit::HostShader,
 ) -> Result<bool, String> {
     let host = host().ok_or_else(|| "no host D3D12 device".to_owned())?;
+    let aniso_point_mip = aniso_point_mip_supported(&host.device);
     let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
     let mut samplers = Vec::new();
     let visibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -453,7 +471,7 @@ pub(crate) fn precompile_compute(
     }
     for (n, s) in shader.static_samplers.iter().enumerate() {
         samplers.push(D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER(s.filter as i32),
+            Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -540,6 +558,7 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        let aniso_point_mip = aniso_point_mip_supported(&host.device);
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -618,7 +637,7 @@ impl HostPipeline {
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
+                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip) as i32),
                     AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
                     AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
                     AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
