@@ -81,9 +81,11 @@ unsafe impl Sync for Staging {}
 
 impl Drop for Staging {
     fn drop(&mut self) {
-        // Retire the upload buffer and its texpool slot so an in-flight GPU
-        // submission or async copy cannot fault on freed staging memory.
-        crate::host::retire((self.buffer.clone(), self._slot.take()));
+        // Retire the upload buffer and its texpool slot until in-flight GPU
+        // submissions finish so async copies cannot fault, while returning
+        // staging slots immediately after submission completion (no command
+        // list holds this `Arc` once it is dropped).
+        crate::host::retire_after_submission((self.buffer.clone(), self._slot.take()));
     }
 }
 

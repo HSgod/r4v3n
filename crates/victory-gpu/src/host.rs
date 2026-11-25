@@ -127,6 +127,21 @@ static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// the title's 60 Hz clock (which ticks many times per host frame while
 /// the host runs at 1-2 fps).
 const KEEP_FRAMES: u64 = 32;
+const KEEP_FRAMES_LOW_MEM: u64 = 4;
+
+fn keep_frames() -> u64 {
+    if low_memory() {
+        KEEP_FRAMES_LOW_MEM
+    } else {
+        KEEP_FRAMES
+    }
+}
+
+/// Retired objects that only need to wait for in-flight GPU submissions to
+/// finish (e.g. texture staging buffers whose `Arc` is no longer held by any
+/// command list or pending upload queue).
+static RETIRED_SUBMISSION: Mutex<std::collections::VecDeque<Retired>> =
+    Mutex::new(std::collections::VecDeque::new());
 
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired {
@@ -142,7 +157,7 @@ struct Retired {
 unsafe impl Send for Retired {}
 
 /// Drops `object` once every submission running now has finished and
-/// [`KEEP_FRAMES`] more frames were presented.
+/// [`keep_frames()`] more frames were presented.
 pub(crate) fn retire<T: 'static>(object: T) {
     let submission = STARTED.load(Ordering::Acquire);
     let frame = crate::queue::presented();
@@ -151,6 +166,21 @@ pub(crate) fn retire<T: 'static>(object: T) {
         frame,
         object: Box::new(object),
     });
+}
+
+/// Drops `object` as soon as every submission started up to now has finished
+/// on the host GPU, without waiting extra presented frames. Use only when no
+/// future or recorded command list can still reference `object`.
+pub(crate) fn retire_after_submission<T: 'static>(object: T) {
+    let submission = STARTED.load(Ordering::Acquire);
+    RETIRED_SUBMISSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(Retired {
+            submission,
+            frame: 0,
+            object: Box::new(object),
+        });
 }
 
 /// Drops what waited for submissions up to `finished` and is old enough
@@ -162,18 +192,25 @@ fn bury(finished: u64) {
         return;
     }
     let now = crate::queue::presented();
+    let keep = keep_frames();
     let done: Vec<Retired> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         // In the order they came: the old ones are at the front.
         let n = retired
             .iter()
             .take_while(|r| {
-                r.submission <= finished && now.saturating_sub(r.frame) >= KEEP_FRAMES
+                r.submission <= finished && now.saturating_sub(r.frame) >= keep
             })
             .count();
         retired.drain(..n).collect()
     };
+    let done_sub: Vec<Retired> = {
+        let mut retired = RETIRED_SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+        let n = retired.iter().take_while(|r| r.submission <= finished).count();
+        retired.drain(..n).collect()
+    };
     drop(done);
+    drop(done_sub);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -939,13 +976,19 @@ const SCRATCH_CHUNK: u64 = 512 << 10;
 static SCRATCH_FREE: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
 /// Free chunks kept; more are released.
 const SCRATCH_KEPT: usize = 256;
+const SCRATCH_KEPT_LOW_MEM: usize = 32;
 
 impl Scratch {
     fn give_back(&mut self) {
         (self.current, self.used) = (0, 0);
+        let kept = if low_memory() {
+            SCRATCH_KEPT_LOW_MEM
+        } else {
+            SCRATCH_KEPT
+        };
         let mut free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner());
         free.append(&mut self.chunks);
-        let over = free.len().saturating_sub(SCRATCH_KEPT);
+        let over = free.len().saturating_sub(kept);
         let over: Vec<_> = free.drain(..over).collect();
         drop(free);
         drop(over);

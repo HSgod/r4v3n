@@ -64,7 +64,10 @@ impl Drop for Slot {
             }
         };
         if let Some(mem) = retired {
-            crate::host::retire(mem);
+            match mem {
+                Memory::Upload(_, _) => crate::host::retire_after_submission(mem),
+                Memory::Heap(_) => crate::host::retire(mem),
+            }
         }
     }
 }
@@ -85,8 +88,10 @@ fn slot(size: (u64, bool), make: impl FnOnce(u64) -> Option<Memory>) -> Option<(
     let of = slabs.entry(size).or_default();
     let bytes = if crate::host::low_memory() {
         if size.1 {
-            // Staging upload slabs: keep padding tight on 16 GB UMA hosts.
-            (size.0 * 2).clamp(128 << 10, 2 << 20).max(size.0)
+            // Staging upload slabs: pack thousands of small 4-64 KiB uploads
+            // tightly (avoiding 64 KiB per-resource vkd3d overhead) while
+            // keeping slab padding small so empty slabs return quickly.
+            (size.0 * 2).clamp(128 << 10, 1 << 20).max(size.0)
         } else {
             // Texture slabs: avoid 8x empty heap padding across dozens of size classes.
             (size.0 * 2).clamp(256 << 10, 4 << 20).max(size.0)
@@ -123,10 +128,7 @@ pub(crate) fn staging(
     host: &crate::host::Host,
     bytes: u64,
 ) -> Option<(ID3D12Resource, *mut u8, u64, Slot)> {
-    // On low-memory/UMA hosts, individual upload buffers return memory to the
-    // OS immediately upon staging eviction instead of pinning fragmented slabs
-    // (~450 MiB observed for 61 MiB of live staging).
-    if cfg!(test) || crate::host::low_memory() || bytes > largest() {
+    if cfg!(test) || bytes > largest() {
         return None;
     }
     let size = class(bytes.max(1));

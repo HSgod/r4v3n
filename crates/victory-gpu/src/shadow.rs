@@ -1580,7 +1580,7 @@ pub(crate) fn sweep(frame: u64) {
         return;
     }
     let gone_only = mode >= 2;
-    let every: u64 = if gone_only { 128 } else { 32 };
+    let every: u64 = if gone_only && !crate::host::low_memory() { 128 } else { 64 };
     if !frame.is_multiple_of(every) {
         return;
     }
@@ -1589,7 +1589,9 @@ pub(crate) fn sweep(frame: u64) {
     if LAST.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let keep: u64 = if gone_only && !crate::host::low_memory() {
+    let keep: u64 = if crate::host::low_memory() {
+        32
+    } else if gone_only {
         600
     } else {
         120
