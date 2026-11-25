@@ -1478,6 +1478,15 @@ static TILES: Mutex<TilePool> = Mutex::new(TilePool {
 });
 
 const POOL_TILES: u32 = 512;
+const POOL_TILES_LOW_MEM: u32 = 128;
+
+fn pool_tiles() -> u32 {
+    if crate::host::low_memory() {
+        POOL_TILES_LOW_MEM
+    } else {
+        POOL_TILES
+    }
+}
 
 fn new_tile() -> Option<Tile> {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1486,8 +1495,9 @@ fn new_tile() -> Option<Tile> {
         crate::memstat::add(&crate::memstat::SHADOWS, PAGE as u64);
         return Some(tile);
     }
-    if pool.heaps.is_empty() || pool.used == POOL_TILES {
-        let size = u64::from(POOL_TILES) * PAGE as u64;
+    let chunk_tiles = pool_tiles();
+    if pool.heaps.is_empty() || pool.used == chunk_tiles {
+        let size = u64::from(chunk_tiles) * PAGE as u64;
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: size,
             Properties: D3D12_HEAP_PROPERTIES {
@@ -1579,7 +1589,11 @@ pub(crate) fn sweep(frame: u64) {
     if LAST.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let keep: u64 = if gone_only { 600 } else { 120 };
+    let keep: u64 = if gone_only && !crate::host::low_memory() {
+        600
+    } else {
+        120
+    };
     let mut given = 0u64;
     let started = std::time::Instant::now();
     let all: Vec<Arc<Shadow>> = SPARSE

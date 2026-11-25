@@ -258,7 +258,7 @@ fn queue(p: Arc<Pending>) {
                 .map(|n| n.clamp(1, 16))
                 .unwrap_or_else(|| {
                     if low_mem {
-                        2
+                        1
                     } else {
                         std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
                     }

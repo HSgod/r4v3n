@@ -123,7 +123,10 @@ pub(crate) fn staging(
     host: &crate::host::Host,
     bytes: u64,
 ) -> Option<(ID3D12Resource, *mut u8, u64, Slot)> {
-    if cfg!(test) || bytes > largest() {
+    // On low-memory/UMA hosts, individual upload buffers return memory to the
+    // OS immediately upon staging eviction instead of pinning fragmented slabs
+    // (~450 MiB observed for 61 MiB of live staging).
+    if cfg!(test) || crate::host::low_memory() || bytes > largest() {
         return None;
     }
     let size = class(bytes.max(1));
