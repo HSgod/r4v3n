@@ -729,6 +729,17 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k && let Some(&m) = self.masks.get(&source) {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -763,6 +774,20 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
