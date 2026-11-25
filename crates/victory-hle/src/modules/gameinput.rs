@@ -63,10 +63,11 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 15] = [
+const FALLBACK_BUTTONS: [(u8, u32); 16] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'O', B),    // Circle, for PlayStation players
     (b'X', X),
@@ -463,16 +464,38 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let kb_pad = fallback(&keys);
         let any_pad = pads.iter().any(Option::is_some);
+        // Merge keyboard stand-in controls (and scripted VICTORY_KEYS) into the
+        // first connected gamepad so keyboard input keeps working even when a
+        // physical or virtual controller (e.g. DualSense on Linux/Proton) is
+        // connected and idle.
+        if let Some(pad) = pads.iter_mut().find_map(Option::as_mut) {
+            pad.buttons |= kb_pad.buttons;
+            pad.left_trigger = pad.left_trigger.max(kb_pad.left_trigger);
+            pad.right_trigger = pad.right_trigger.max(kb_pad.right_trigger);
+            if kb_pad.left_x != 0.0 {
+                pad.left_x = kb_pad.left_x;
+            }
+            if kb_pad.left_y != 0.0 {
+                pad.left_y = kb_pad.left_y;
+            }
+            if kb_pad.right_x != 0.0 {
+                pad.right_x = kb_pad.right_x;
+            }
+            if kb_pad.right_y != 0.0 {
+                pad.right_y = kb_pad.right_y;
+            }
+        }
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then_some(Value::Pad(kb_pad));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
