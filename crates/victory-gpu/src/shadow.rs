@@ -2227,10 +2227,15 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -2258,7 +2263,7 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
     let Some(end) = address.checked_add(len.max(1)) else {
         return false;
     };
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -2282,6 +2287,24 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     if let Some(copy) = sparse(address, end) {
         return Some(copy);
+    }
+    // Shared-read fast path: nearly all lookups hit an existing buffer shadow
+    // or determine that no registered buffer holds the address.
+    {
+        let map = buffers_read();
+        let mut any_holding = false;
+        for (_, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if e.end >= end {
+                any_holding = true;
+                if let Some(shadow) = &e.shadow {
+                    return Some(shadow.clone());
+                }
+            }
+        }
+        if !any_holding {
+            drop(map);
+            return loose(address, end);
+        }
     }
     let mut map = buffers();
     let holding: Vec<((u64, usize), bool)> = map
@@ -2351,7 +2374,7 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // To the end of the innermost buffer holding it: a window ending sooner
     // faults.
-    let end = buffers()
+    let end = buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -2374,7 +2397,8 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
@@ -2382,7 +2406,20 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    // Shared-read fast path: most loose-window lookups hit an existing window.
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = map
+            .range(..=(start, u64::MAX))
+            .rev()
+            .take(64)
+            .find(|((s, l), _)| *s <= address && s + l >= end)
+            .map(|(_, shadow)| shadow.clone())
+        {
+            return Some(shadow);
+        }
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
     if let Some(shadow) = map
@@ -2425,13 +2462,13 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
