@@ -1593,3 +1593,154 @@ fn scalar_counted_in_nested_divergent_loops() {
         "inner iterations counted: {got:?}"
     );
 }
+
+const fn vop3_clamp(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let mut w = vop3(op, vdst, src0, src1, src2);
+    w[0] |= 1 << 15;
+    w
+}
+
+/// `v_cvt_u32_f32` saturates out-of-range inputs and returns 0 for NaN/negative
+/// even on SPIR-V / RADV backends where raw OpConvertFToU is undefined.
+#[test]
+fn cvt_u32_f32_full_range_and_nan() {
+    let shader = build_valu_cs(&[vop1(0x007, 0, vgpr(1))]);
+    let table: [(u32, u32); 10] = [
+        (0.0f32.to_bits(), 0),
+        ((-0.0f32).to_bits(), 0),
+        ((-1.0f32).to_bits(), 0),
+        (f32::NEG_INFINITY.to_bits(), 0),
+        (0x7FC0_0000, 0), // qNaN
+        (0x7F80_0001, 0), // sNaN
+        (42.9f32.to_bits(), 42),
+        (0x4F7F_FFFF, 0xFFFF_FF00), // largest f32 < 2^32
+        (4294967296.0f32.to_bits(), u32::MAX),
+        (f32::INFINITY.to_bits(), u32::MAX),
+    ];
+    let cases: Vec<[u32; 4]> = table.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let (bits, expected) = table[i];
+        assert_eq!(
+            got, expected,
+            "{backend}: v_cvt_u32_f32({bits:#010x}) = {got:#x}, want {expected:#x}"
+        );
+    });
+}
+
+/// `v_cvt_i32_f32` saturates out-of-range inputs and returns 0 for NaN.
+#[test]
+fn cvt_i32_f32_full_range_and_nan() {
+    let shader = build_valu_cs(&[vop1(0x008, 0, vgpr(1))]);
+    let table: [(u32, u32); 10] = [
+        (0.0f32.to_bits(), 0),
+        (0x7FC0_0000, 0), // qNaN
+        (f32::NEG_INFINITY.to_bits(), i32::MIN as u32),
+        ((-2147483648.0f32).to_bits(), i32::MIN as u32),
+        ((-4294967296.0f32).to_bits(), i32::MIN as u32),
+        (0x4EFF_FFFF, 2147483520u32), // largest f32 < 2^31
+        (2147483648.0f32.to_bits(), i32::MAX as u32),
+        (f32::INFINITY.to_bits(), i32::MAX as u32),
+        ((-42.9f32).to_bits(), (-42i32) as u32),
+        (42.9f32.to_bits(), 42),
+    ];
+    let cases: Vec<[u32; 4]> = table.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let (bits, expected) = table[i];
+        assert_eq!(
+            got, expected,
+            "{backend}: v_cvt_i32_f32({bits:#010x}) = {got:#x}, want {expected:#x}"
+        );
+    });
+}
+
+/// `v_cvt_rpi_i32_f32` rounds midpoints toward +infinity without mis-rounding
+/// `0.5 - ulp` or large odd integral floats.
+#[test]
+fn cvt_rpi_i32_f32_ties_toward_pos_inf() {
+    let shader = build_valu_cs(&[vop1(0x00c, 0, vgpr(1))]);
+    let table: [(u32, u32); 9] = [
+        (0.5f32.to_bits(), 1),
+        (1.5f32.to_bits(), 2),
+        ((-0.5f32).to_bits(), 0),
+        ((-1.5f32).to_bits(), (-1i32) as u32),
+        (0x3EFF_FFFF, 0), // 0.5 - 1 ulp
+        (8388609.0f32.to_bits(), 8388609),
+        (0x7FC0_0000, 0), // qNaN
+        (2147483648.0f32.to_bits(), i32::MAX as u32),
+        ((-2147483648.0f32).to_bits(), i32::MIN as u32),
+    ];
+    let cases: Vec<[u32; 4]> = table.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let (bits, expected) = table[i];
+        assert_eq!(
+            got, expected,
+            "{backend}: v_cvt_rpi_i32_f32({bits:#010x}) = {got:#x}, want {expected:#x}"
+        );
+    });
+}
+
+/// Integer VOP3 `clamp` saturates unsigned/signed add/sub and 24-bit MAD.
+#[test]
+fn integer_clamp_saturates_add_sub_and_mad24() {
+    let check_op = |label: &str, op: u16, cases: &[([u32; 4], u32)]| {
+        let shader = build_valu_cs(&vop3_clamp(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|&(c, _)| c).collect();
+        run_cases(&shader, &inputs, |backend, i, c, got| {
+            let expected = cases[i].1;
+            assert_eq!(
+                got, expected,
+                "{backend}: {label}({:#x}, {:#x}, {:#x}) = {got:#x}, want {expected:#x}",
+                c[0], c[1], c[2]
+            );
+        });
+    };
+    check_op(
+        "v_add_nc_u32 clamp",
+        0x125,
+        &[
+            ([10, 20, 0, 0], 30),
+            ([0xFFFF_FFF0, 0x20, 0, 0], u32::MAX),
+        ],
+    );
+    check_op(
+        "v_sub_nc_u32 clamp",
+        0x126,
+        &[([20, 10, 0, 0], 10), ([10, 20, 0, 0], 0)],
+    );
+    check_op(
+        "v_add_nc_i32 clamp",
+        0x37f,
+        &[
+            ([0x7FFF_FFF0, 0x20, 0, 0], i32::MAX as u32),
+            ([0x8000_0010, (-0x20i32) as u32, 0, 0], i32::MIN as u32),
+            ([10, (-25i32) as u32, 0, 0], (-15i32) as u32),
+        ],
+    );
+    check_op(
+        "v_sub_nc_i32 clamp",
+        0x376,
+        &[
+            ([0x7FFF_FFF0, (-0x20i32) as u32, 0, 0], i32::MAX as u32),
+            ([0x8000_0010, 0x20, 0, 0], i32::MIN as u32),
+            ([10, 25, 0, 0], (-15i32) as u32),
+        ],
+    );
+    check_op(
+        "v_mad_u32_u24 clamp",
+        0x143,
+        &[
+            ([1000, 2000, 500, 0], 2_000_500),
+            ([0x00FF_FFFF, 0x00FF_FFFF, 0, 0], u32::MAX),
+            ([0x0001_0000, 0x0000_FFFF, 0x0002_0000, 0], u32::MAX),
+        ],
+    );
+    check_op(
+        "v_mad_i32_i24 clamp",
+        0x142,
+        &[
+            ([1000, (-2000i32) as u32, 500, 0], (-1_999_500i32) as u32),
+            ([0x0080_0000, 0x0080_0000, 0, 0], i32::MAX as u32),
+            ([0x0080_0000, 0x007F_FFFF, 0, 0], i32::MIN as u32),
+        ],
+    );
+}
