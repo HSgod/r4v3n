@@ -248,7 +248,6 @@ fn endless(name: &str, begins: bool) {
     // what takes memory all along goes first.
     const ENDLESS: Duration = Duration::from_secs(20);
     const EVEN_SO: Duration = Duration::from_secs(150);
-    const GROWTH: u64 = 3 << 30;
     static AT_WORK: Mutex<Vec<(String, Instant, u32)>> = Mutex::new(Vec::new());
     static WATCH: std::sync::Once = std::sync::Once::new();
     {
@@ -265,6 +264,11 @@ fn endless(name: &str, begins: bool) {
         let _ = std::thread::Builder::new()
             .name("victory-compiles".into())
             .spawn(|| {
+                let growth: u64 = if crate::host::low_memory() {
+                    3 << 29 // 1.5 GiB on 16 GB / UMA hosts
+                } else {
+                    3 << 30 // 3 GiB
+                };
                 let mut noted: Vec<String> = Vec::new();
                 // The process's commit when a compile was first seen late.
                 let mut late: Option<u64> = None;
@@ -286,7 +290,7 @@ fn endless(name: &str, begins: bool) {
                         continue;
                     }
                     let now = committed();
-                    let grown = now.saturating_sub(*late.get_or_insert(now)) > GROWTH;
+                    let grown = now.saturating_sub(*late.get_or_insert(now)) > growth;
                     let long: Vec<(String, u32)> = if grown {
                         late = None;
                         long

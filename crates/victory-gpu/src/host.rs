@@ -271,6 +271,67 @@ pub(crate) fn video_memory() -> Option<[(u64, u64); 2]> {
     ])
 }
 
+/// Whether the host runs with a tight physical memory budget (<= 18 GiB RAM,
+/// e.g. 16 GB unified RAM/VRAM systems like PS5 Linux or handheld APUs).
+/// `VICTORY_LOW_MEM=1` forces it on; `VICTORY_LOW_MEM=0` forces it off.
+pub(crate) fn low_memory() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    static LOW: OnceLock<bool> = OnceLock::new();
+    *LOW.get_or_init(|| {
+        if let Some(v) = std::env::var_os("VICTORY_LOW_MEM") {
+            let on = v != "0";
+            tracing::info!(on, "VICTORY_LOW_MEM override");
+            return on;
+        }
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: properly sized MEMORYSTATUSEX out-struct.
+        let total = unsafe {
+            let mut st: MEMORYSTATUSEX = std::mem::zeroed();
+            st.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut st) != 0 {
+                st.ullTotalPhys
+            } else {
+                0
+            }
+        };
+        let low = total != 0 && total <= (18u64 << 30);
+        if low {
+            tracing::info!(
+                total_mib = total >> 20,
+                "16 GB / low-memory profile active (VICTORY_LOW_MEM=0 to disable)"
+            );
+        }
+        low
+    })
+}
+
+/// Whether the host D3D12 adapter uses unified memory architecture (UMA), where
+/// L0 system RAM and L1 VRAM are the same physical pool.
+pub(crate) fn is_uma() -> bool {
+    static UMA: OnceLock<bool> = OnceLock::new();
+    *UMA.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+        // SAFETY: plain feature query on a live device.
+        let ok = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_ARCHITECTURE1,
+                    (&raw mut arch).cast(),
+                    size_of::<D3D12_FEATURE_DATA_ARCHITECTURE1>() as u32,
+                )
+                .is_ok()
+        };
+        let uma = ok && arch.UMA.as_bool();
+        if uma {
+            tracing::info!("host GPU reports UMA (unified RAM/VRAM)");
+        }
+        uma
+    })
+}
+
 pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),

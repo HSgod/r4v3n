@@ -248,10 +248,21 @@ fn queue(p: Arc<Pending>) {
     let sender = SENDER[usize::from(screen)].get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
+        let low_mem = crate::host::low_memory();
         let workers = if screen {
-            2
+            if low_mem { 1 } else { 2 }
         } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            std::env::var("VICTORY_PIPELINE_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .map(|n| n.clamp(1, 16))
+                .unwrap_or_else(|| {
+                    if low_mem {
+                        2
+                    } else {
+                        std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+                    }
+                })
         };
         for i in 0..workers {
             worker(i + if screen { 50 } else { 0 }, screen);

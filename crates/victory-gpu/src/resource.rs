@@ -1152,10 +1152,19 @@ fn over_cap(d: &ResourceDesc) -> u32 {
     if !STREAMED.get() || textures() != Textures::Stream {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match video_memory_percent() {
-        0..70 => 1024,
-        70..85 => 512,
-        _ => 256,
+    let max = set.unwrap_or_else(|| {
+        if crate::host::low_memory() {
+            match video_memory_percent() {
+                0..60 => 512,
+                _ => 256,
+            }
+        } else {
+            match video_memory_percent() {
+                0..70 => 1024,
+                70..85 => 512,
+                _ => 256,
+            }
+        }
     });
     const TEXTURE2D: u32 = 3;
     let block = (70..=84).contains(&d.format) || (94..=99).contains(&d.format);

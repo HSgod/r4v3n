@@ -135,8 +135,9 @@ fn pooled(n: usize) -> Vec<u8> {
 /// each time, a tenth of the submitting thread's time).
 static TILE_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
-/// Tile snapshots kept at most (512 MiB).
+/// Tile snapshots kept at most (512 MiB; 128 MiB on low-memory hosts).
 const TILE_POOL_MOST: usize = 8192;
+const TILE_POOL_LOW_MEM: usize = 2048;
 
 /// `n` empty buffers with room for a tile, under one lock of the pool.
 fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
@@ -152,9 +153,14 @@ fn pooled_tiles(n: usize) -> Vec<Vec<u8>> {
 
 /// Returns tile snapshots to their pool.
 fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
+    let limit = if crate::host::low_memory() {
+        TILE_POOL_LOW_MEM
+    } else {
+        TILE_POOL_MOST
+    };
     let mut pool = TILE_POOL.lock().unwrap_or_else(|e| e.into_inner());
     for v in all {
-        if pool.len() < TILE_POOL_MOST && v.capacity() >= PAGE {
+        if pool.len() < limit && v.capacity() >= PAGE {
             pool.push(v);
         }
     }
@@ -1549,7 +1555,10 @@ fn sweeps() -> u8 {
         if cfg!(test) {
             return 1;
         }
-        std::env::var("VICTORY_SWEEP_TILES").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        std::env::var("VICTORY_SWEEP_TILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| if crate::host::low_memory() { 2 } else { 0 })
     })
 }
 
