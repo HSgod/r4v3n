@@ -84,6 +84,18 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
     }
+    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some_and(|v| v != "0") {
+        // SAFETY: just mapped, and no title code has run.
+        let n = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
+        if n > 0 {
+            tracing::info!(patches = n, "title watchdog disarmed");
+        }
+    }
+    // SAFETY: just mapped, and no title code has run.
+    let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
+    if levers > 0 {
+        tracing::info!(patches = levers, "title resolution hooks applied");
+    }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
         preferred = format_args!("{:#x}", loaded.info.image_base),

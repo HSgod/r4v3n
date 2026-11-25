@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -111,6 +112,27 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Ahead-of-time translate shaders into the runtime shader cache (and
+    /// optionally precompile compute PSOs into the pipeline library).
+    Precompile {
+        paths: Vec<PathBuf>,
+        /// Also compile compute PSOs into the host pipeline library and GPU
+        /// driver shader cache.
+        #[arg(long)]
+        pipelines: bool,
+        /// Restrict to one shader stage (`vs`, `ps`, `ms`, `cs`).
+        #[arg(long, value_enum)]
+        only: Option<precompile::StageFilter>,
+        /// Stop after N unique shader containers (testing lever).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Translation worker threads (default: logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Max concurrent GPU driver compilations with --pipelines (default: 2).
+        #[arg(long)]
+        pipeline_jobs: Option<usize>,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -168,6 +190,14 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Precompile {
+            paths,
+            pipelines,
+            only,
+            limit,
+            jobs,
+            pipeline_jobs,
+        } => precompile::run(paths, pipelines, only, limit, jobs, pipeline_jobs),
         Command::Config => show_config(),
     }
 }

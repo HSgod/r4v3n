@@ -394,6 +394,110 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Compiles one translated compute shader into the host pipeline library (and
+/// GPU driver shader cache) using the exact same root signature and library
+/// key as [`HostPipeline::new`]. Returns `Ok(true)` if already loaded from the
+/// library, `Ok(false)` if freshly compiled and stored.
+pub(crate) fn precompile_compute(
+    shader: &victory_shader::emit::HostShader,
+) -> Result<bool, String> {
+    let host = host().ok_or_else(|| "no host D3D12 device".to_owned())?;
+    let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+    let mut samplers = Vec::new();
+    let visibility = D3D12_SHADER_VISIBILITY_ALL;
+    let dwords = shader.user_data_dwords();
+    if dwords > 0 {
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+    }
+    for (slots, kind) in [
+        (&shader.root_cbvs, D3D12_ROOT_PARAMETER_TYPE_CBV),
+        (&shader.root_srvs, D3D12_ROOT_PARAMETER_TYPE_SRV),
+        (&shader.root_uavs, D3D12_ROOT_PARAMETER_TYPE_UAV),
+    ] {
+        for &slot in slots {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: kind,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+    }
+    if shader.stride_table {
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: STRIDE_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+    }
+    for (n, s) in shader.static_samplers.iter().enumerate() {
+        samplers.push(D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER(s.filter as i32),
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+            MipLODBias: s.mip_lod_bias,
+            MaxAnisotropy: s.max_anisotropy,
+            ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+            BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+            MinLOD: s.min_lod,
+            MaxLOD: s.max_lod,
+            ShaderRegister: n as u32,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: visibility,
+        });
+    }
+    let (root, root_blob) = root_signature(&host.device, &params, &samplers, true)
+        .map_err(|e| format!("root signature refused: {e}"))?;
+    let cs = D3D12_SHADER_BYTECODE {
+        pShaderBytecode: shader.dxil.as_ptr().cast(),
+        BytecodeLength: shader.dxil.len(),
+    };
+    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        // SAFETY: a borrowed pointer the description never releases.
+        pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+        CS: cs,
+        ..Default::default()
+    };
+    let name = super::library::name("compute", &root_blob, &[&shader.dxil], "");
+    let (_pso, loaded) = super::library::pipeline_with_status(
+        &name,
+        // SAFETY: the description points at live data.
+        |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+        // SAFETY: as above.
+        || unsafe { host.device.CreateComputePipelineState(&desc) },
+    )
+    .map_err(|e| {
+        host.log_messages();
+        format!("compute pipeline refused: {e}")
+    })?;
+    if !loaded {
+        super::library::save(false);
+    }
+    Ok(loaded)
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.

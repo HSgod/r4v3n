@@ -68,6 +68,11 @@ impl Cache {
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
+            // Concurrent writers of the same content-addressed key can race on
+            // Windows/Wine where rename does not overwrite an existing file.
+            if path.is_file() {
+                return Ok(path);
+            }
         }
         published?;
         Ok(path)

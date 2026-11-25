@@ -80,6 +80,15 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
 pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+    host_shader_cached(container, target).map(|(shader, _)| shader)
+}
+
+/// Same as [`host_shader`], also returning `true` if the shader was loaded
+/// from disk rather than translated now.
+pub(crate) fn host_shader_cached(
+    container: &[u8],
+    target: Target,
+) -> Result<(HostShader, bool), String> {
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -94,9 +103,9 @@ pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader
                 h.update(format!("{patches:?}").as_bytes());
                 key = *h.finalize().as_bytes();
             }
-            cached(cache, &key, container, translate)
+            cached_with_status(cache, &key, container, translate)
         }
-        None => translate(container),
+        None => translate(container).map(|s| (s, false)),
     }
 }
 
@@ -131,12 +140,22 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
 }
 
+#[cfg(test)]
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
+    cached_with_status(cache, build, container, translate).map(|(s, _)| s)
+}
+
+fn cached_with_status(
+    cache: &Cache,
+    build: &[u8; 32],
+    container: &[u8],
+    translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
+) -> Result<(HostShader, bool), String> {
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
@@ -147,20 +166,21 @@ fn cached(
             .get_or_convert(&converter, &input)
             .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
+            let from_cache = !converter.ran.load(Ordering::Relaxed);
+            let (counter, what) = if from_cache {
                 (&HITS, "from the cache")
+            } else {
+                (&MISSES, "translated and cached")
             };
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
-            return Ok(shader);
+            return Ok((shader, from_cache));
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    (converter.translate)(container).map(|s| (s, false))
 }
 
 const MAGIC: &[u8; 4] = b"VSH2";

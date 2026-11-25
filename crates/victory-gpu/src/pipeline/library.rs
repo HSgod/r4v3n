@@ -358,6 +358,16 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    pipeline_with_status(name, load, create).map(|(pso, _)| pso)
+}
+
+/// Same as [`pipeline`], also returning `true` when loaded from the pipeline
+/// library rather than freshly compiled.
+pub(crate) fn pipeline_with_status(
+    name: &str,
+    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<(ID3D12PipelineState, bool)> {
     let wide = HSTRING::from(name);
     if crashed(name) {
         // E_FAIL.
@@ -369,11 +379,11 @@ pub(crate) fn pipeline(
     };
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return create().map(|pso| (pso, false));
     };
     if let Ok(pso) = load(&library.lock().unwrap_or_else(|e| e.into_inner()).library, PCWSTR(wide.as_ptr())) {
         LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
+        return Ok((pso, true));
     }
     // Compiled outside the lock: compiles take up to seconds.
     let pso = create()?;
@@ -384,7 +394,7 @@ pub(crate) fn pipeline(
     if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
         l.added += 1;
     }
-    Ok(pso)
+    Ok((pso, false))
 }
 
 /// Writes the library and the early list if pipelines were added since the
