@@ -174,6 +174,27 @@ pub const VIEW_SLOTS: u32 = 2_294_784;
 /// such views stay below.
 pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
 
+/// Active host view-heap slot count: [`VIEW_SLOTS`] on tier-3 / uncapped hosts,
+/// or a smaller cap (e.g. `1_000_000` on DirectMesh / Tier-2 hosts) set once
+/// by `victory-gpu` before shaders are translated.
+static HOST_VIEW_SLOTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(VIEW_SLOTS);
+
+/// Sets the active host view-heap size shaders clamp bindless indices to.
+pub fn set_view_slots(slots: u32) {
+    HOST_VIEW_SLOTS.store(slots.max(2048), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Active host view-heap slot count (`<= VIEW_SLOTS`).
+pub fn view_slots() -> u32 {
+    HOST_VIEW_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Slots before the memory-by-address views for the active host view-heap size.
+pub fn own_slots() -> u32 {
+    view_slots().saturating_sub(1024)
+}
+
 
 /// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
 /// take them from title data, and one past the heap stops the host GPU.

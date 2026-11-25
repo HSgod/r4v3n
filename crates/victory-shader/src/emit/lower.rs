@@ -6264,7 +6264,7 @@ impl<'a> Lower<'a> {
             } else {
                 self.heap_index_at(site, skew.wrapping_neg(), false)?
             };
-            let n = self.slot_dword(slot, super::OWN_SLOTS);
+            let n = self.slot_dword(slot, super::own_slots());
             for k in 0..count {
                 if (k as i32).wrapping_add(skew) == 2 {
                     self.write(inst, Reg::S(code + k as u8), n, None);
@@ -7179,7 +7179,7 @@ impl<'a> Lower<'a> {
         let table = self.s.stride_table_handle();
         // A root view has no bounds: a wild index would read past the table.
         let slot = if super::limits_indices() || from != 0 {
-            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::OWN_SLOTS - 1));
+            let (i32t, last) = (self.s.t.i32, self.s.m.i32(super::own_slots() - 1));
             self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last])
         } else {
             slot
@@ -12255,7 +12255,10 @@ impl<'a> Lower<'a> {
         let culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut args = vec![self.mesh_thread()];
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            // RDNA2 `exp prim` packs three 10-bit fields where bits [8:0] are
+            // the vertex index and bit 9 (bits 9/19/29) is the edge flag.
+            // Mask to 9 bits (0x1FF) so edge flags do not corrupt vertex indices.
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             args.push(self.s.m.select(c, culled, z, i));

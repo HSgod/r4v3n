@@ -65,21 +65,26 @@ pub(crate) struct HostHeap {
     memory_seen: Mutex<u64>,
 }
 
-/// The dword of the stride table the element counts start at.
-const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
+/// The dword of the stride table the element counts start at (matches
+/// `victory_shader::emit::own_slots()`).
+fn counts_at() -> u32 {
+    victory_shader::emit::own_slots()
+}
 
 struct StrideTable {
     _resource: ID3D12Resource,
     ptr: usize,
     gpu: u64,
     len: u32,
+    counts_at: u32,
 }
 
 impl StrideTable {
-    /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
+    /// The element counts follow the strides, from `counts_at` dwords on
     /// (where shaders, which know no heap's size, look for them).
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
+        let counts_at = counts_at();
+        let bytes = ((u64::from(counts_at) + u64::from(len)) * 4).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -120,6 +125,7 @@ impl StrideTable {
             ptr: p as usize,
             gpu,
             len,
+            counts_at,
         })
     }
 }
@@ -519,12 +525,43 @@ const DYNAMIC_CAPPED: u32 = 1 << 16;
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 
+/// Probes once whether the host supports full [`victory_shader::emit::VIEW_SLOTS`]
+/// shader-visible view heaps or caps them at [`PORTABLE_VIEWS`] (e.g. DirectMesh
+/// RADV without `VK_EXT_descriptor_heap` or Tier-2 GPUs), and updates the shader
+/// translator's clamp limit before the first shader translates.
+pub(crate) fn probe_view_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Some(host) = host() else { return };
+        // SAFETY: plain heap creation; the probe heap is released immediately.
+        let full: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: victory_shader::emit::VIEW_SLOTS,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        };
+        if full.is_err() {
+            victory_shader::emit::set_view_slots(PORTABLE_VIEWS);
+            tracing::info!(
+                slots = PORTABLE_VIEWS,
+                "host caps view heaps at {PORTABLE_VIEWS}: shader view indices clamped to match"
+            );
+        }
+    });
+}
+
 /// The slots to make of a view heap of `count` title and dynamic slots: with
 /// those of [`crate::memory`] after them, and enough that shaders' indices,
-/// which stay below [`victory_shader::emit::VIEW_SLOTS`], are inside it.
+/// which stay below [`victory_shader::emit::view_slots()`], are inside it.
 fn view_slots(count: u32) -> u32 {
     let slots = count + crate::memory::SLOTS;
-    if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
+    if cfg!(test) {
+        slots
+    } else {
+        slots.max(victory_shader::emit::view_slots())
+    }
 }
 
 /// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
@@ -534,6 +571,9 @@ const SAMPLER_DYNAMIC: u32 = 256;
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
+        if !sampler {
+            probe_view_limit();
+        }
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
         } else {
@@ -666,7 +706,7 @@ impl HostHeap {
         let started = std::time::Instant::now();
         // SAFETY: a plain call on a live heap.
         let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
-        if !sampler && total < victory_shader::emit::VIEW_SLOTS {
+        if !sampler && total < victory_shader::emit::view_slots() {
             tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
         }
         if let Err(e) = h.fill_null(kind, total) {
@@ -1004,10 +1044,10 @@ impl HostHeap {
             && index < t.len
         {
             // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
-            // `COUNTS_AT + t.len` dwords.
+            // `t.counts_at + t.len` dwords.
             unsafe {
                 *(t.ptr as *mut u32).add(index as usize) = stride;
-                *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
+                *(t.ptr as *mut u32).add((t.counts_at + index) as usize) = count;
             }
         }
     }

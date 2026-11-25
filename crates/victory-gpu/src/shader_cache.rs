@@ -63,6 +63,10 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
+                // View heap limit differs by host GPU/driver (e.g. 1,000,000 on
+                // DirectMesh/Tier-2 vs 2,294,784 on Tier-3): key the cache by it.
+                crate::descriptor::host::probe_view_limit();
+                bytes.extend_from_slice(&victory_shader::emit::view_slots().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

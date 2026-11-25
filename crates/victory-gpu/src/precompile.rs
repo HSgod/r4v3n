@@ -36,6 +36,7 @@ pub struct PreparedShader {
 /// as `victory run`.
 pub fn init_host() -> Result<HostInfo, String> {
     let host = crate::host::host().ok_or_else(|| "no host D3D12 device available".to_owned())?;
+    crate::descriptor::host::probe_view_limit();
     Ok(HostInfo {
         target: host.target(),
         mesh_shaders: host.mesh_shaders(),
